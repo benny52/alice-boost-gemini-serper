@@ -1,5 +1,6 @@
 import { clipText, safeHistory, packState, readState } from '../lib/session.js';
 import { fetchJson } from '../lib/http.js';
+import { askOpenRouter } from '../lib/openrouter.js';
 import { isSearchIntent, planSearch, searchWeb, searchFailureText } from '../lib/search.js';
 
 const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
@@ -68,8 +69,15 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
 function errorForUser(error) {
   switch (error?.message) {
+    case 'INVALID_LLM_BACKEND':
+    case 'MISSING_OPENROUTER_KEY':
     case 'MISSING_GEMINI_KEY': return 'Сервер пока не настроен. Не удалось подключиться к нейросети.';
+    case 'OPENROUTER_ACCESS_DENIED':
     case 'GEMINI_KEY_REJECTED': return 'Не удалось подключиться к нейросети. Нужно проверить настройки доступа.';
+    case 'OPENROUTER_BALANCE': return 'Не удалось получить ответ: нужно проверить баланс OpenRouter.';
+    case 'OPENROUTER_QUOTA': return 'Сейчас превышен лимит запросов к нейросети. Попробуй немного позже.';
+    case 'OPENROUTER_SEARCH_UNVERIFIED': return 'Не удалось подтвердить ответ источниками из поиска. Попробуй уточнить вопрос.';
+    case 'OPENROUTER_OUTPUT_LIMIT': return 'Ответ получился слишком длинным. Попробуй задать вопрос короче.';
     case 'GEMINI_QUOTA': return 'Сейчас превышен лимит запросов к Gemini. Попробуй немного позже.';
     case 'GEMINI_BLOCKED': return 'Я не смогла обработать этот запрос. Попробуй спросить иначе.';
     case 'TIME_BUDGET_EXHAUSTED':
@@ -96,6 +104,14 @@ export default async function handler(req, res) {
   const searchPlan = planSearch(text, state);
   const nextSearch = searchPlan.required ? { query: searchPlan.topic } : {};
   try {
+    const backend = String(process.env.LLM_BACKEND || 'gemini').trim();
+    if (backend === 'openrouter') {
+      const result = await askOpenRouter(text, state.history, searchPlan, remainingMs() - FINAL_RESPONSE_RESERVE_MS);
+      const spokenAnswer = fitAliceText(result.answer);
+      const search = result.searched ? { query: searchPlan.topic || text } : nextSearch;
+      return reply(spokenAnswer, [...state.history, { role: 'user', text }, { role: 'model', text: spokenAnswer }], search);
+    }
+    if (backend !== 'gemini') throw new Error('INVALID_LLM_BACKEND');
     let searchContext = '';
     if (searchPlan.required) {
       const search = await searchWeb(searchPlan.query, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - MIN_GEMINI_BUDGET_MS - FINAL_RESPONSE_RESERVE_MS)));
@@ -109,7 +125,7 @@ export default async function handler(req, res) {
     const spokenAnswer = fitAliceText(answer);
     return reply(spokenAnswer, [...state.history, { role: 'user', text }, { role: 'model', text: spokenAnswer }], nextSearch);
   } catch (error) {
-    const known = /^(?:MISSING_GEMINI_KEY|INVALID_MODEL_NAME|GEMINI_KEY_REJECTED|GEMINI_QUOTA|GEMINI_BLOCKED|GEMINI_EMPTY_RESPONSE|GEMINI_REQUEST_FAILED|TIME_BUDGET_EXHAUSTED|REQUEST_TIMEOUT)$/;
+    const known = /^(?:INVALID_LLM_BACKEND|MISSING_OPENROUTER_KEY|OPENROUTER_ACCESS_DENIED|OPENROUTER_BALANCE|OPENROUTER_QUOTA|OPENROUTER_REQUEST_FAILED|OPENROUTER_OUTPUT_LIMIT|OPENROUTER_INCOMPLETE_RESPONSE|OPENROUTER_EMPTY_RESPONSE|OPENROUTER_SEARCH_UNVERIFIED|MISSING_GEMINI_KEY|INVALID_MODEL_NAME|GEMINI_KEY_REJECTED|GEMINI_QUOTA|GEMINI_BLOCKED|GEMINI_EMPTY_RESPONSE|GEMINI_REQUEST_FAILED|TIME_BUDGET_EXHAUSTED|REQUEST_TIMEOUT)$/;
     console.warn(known.test(error?.message) ? error.message : 'UPSTREAM_ERROR');
     return reply(errorForUser(error), state.history, nextSearch);
   }
