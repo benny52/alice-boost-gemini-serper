@@ -1,5 +1,6 @@
 import { clipText, safeHistory, packState, readState } from '../lib/session.js';
 import { fetchJson } from '../lib/http.js';
+import { memoryConfig, conversationId, loadMemory, saveMemory, logMemoryError, MEMORY_WRITE_TIMEOUT_MS } from '../lib/memory.js';
 import { askOpenRouter } from '../lib/openrouter.js';
 import { isSearchIntent, planSearch, searchWeb, searchFailureText } from '../lib/search.js';
 
@@ -97,34 +98,88 @@ export default async function handler(req, res) {
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === 'object' ? req.body : {};
   const text = String(body?.request?.command || body?.request?.original_utterance || '').trim();
-  const state = readState(body?.session?.new ? {} : body?.state?.session);
+  let state = readState(body?.session?.new ? {} : body?.state?.session);
   const reply = (answer, history = state.history, search = state.search) => res.status(200).json(aliceResponse(answer, false, history, search));
-  if (!text) return reply('Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?');
-  if (/^(?:забудь разговор|начнём сначала|начнем сначала)[.!?]*$/i.test(text)) return reply('Хорошо, начнём новый разговор.', [], {});
+  let config;
+  try {
+    config = memoryConfig();
+  } catch (error) {
+    logMemoryError(error, 'CONFIG');
+    return reply('Память пока не настроена. Нужно проверить настройки сервера.');
+  }
+  const id = config ? conversationId(body.session) : null;
+  let stored = null;
+  if (config && id) {
+    try {
+      stored = await loadMemory(config, id, remainingMs() - FINAL_RESPONSE_RESERVE_MS);
+      state = { history: stored.history, search: stored.search };
+    } catch (error) {
+      logMemoryError(error, 'READ');
+    }
+  }
+  const memoryUnavailable = Boolean(config && !stored);
+  const withMemoryWarning = answer => {
+    const warning = 'Не удалось подтвердить запись в память.';
+    return clipText(fitAliceText(answer), MAX_ALICE_TEXT - warning.length - 2).trimEnd() + ' ' + warning;
+  };
+  const finishAnswer = async (answer, search) => {
+    const spokenAnswer = fitAliceText(answer);
+    const history = safeHistory([...state.history, { role: 'user', text }, { role: 'model', text: spokenAnswer }]);
+    if (config) {
+      if (memoryUnavailable) return reply(withMemoryWarning(spokenAnswer));
+      try {
+        await saveMemory(config, id, stored, history, search, remainingMs() - FINAL_RESPONSE_RESERVE_MS);
+      } catch (error) {
+        logMemoryError(error, 'WRITE');
+        return reply(withMemoryWarning(spokenAnswer));
+      }
+    }
+    return reply(spokenAnswer, history, search);
+  };
+  const writeReserveMs = config && stored ? MEMORY_WRITE_TIMEOUT_MS : 0;
+  const modelBudgetMs = () => remainingMs() - FINAL_RESPONSE_RESERVE_MS - writeReserveMs;
+
+  if (!text) {
+    const greeting = 'Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?';
+    return reply(memoryUnavailable ? greeting + ' Память сейчас недоступна.' : greeting);
+  }
+  if (/^(?:забудь разговор|забудь вс[её]|начнём сначала|начнем сначала)[.!?]*$/i.test(text)) {
+    if (config) {
+      if (memoryUnavailable) return reply('Не удалось подтвердить очистку памяти. Попробуй ещё раз.');
+      try {
+        // Keep an empty revision so a pre-clear request cannot insert old history again.
+        await saveMemory(config, id, stored, [], {}, remainingMs() - FINAL_RESPONSE_RESERVE_MS);
+      } catch (error) {
+        logMemoryError(error, 'WRITE');
+        return reply('Не удалось подтвердить очистку памяти. Попробуй ещё раз.');
+      }
+    }
+    return reply('Хорошо, начнём новый разговор.', [], {});
+  }
 
   const searchPlan = planSearch(text, state);
   const nextSearch = searchPlan.required ? { query: searchPlan.topic } : {};
   try {
     const backend = String(process.env.LLM_BACKEND || 'gemini').trim();
     if (backend === 'openrouter') {
-      const result = await askOpenRouter(text, state.history, searchPlan, remainingMs() - FINAL_RESPONSE_RESERVE_MS);
+      const result = await askOpenRouter(text, state.history, searchPlan, modelBudgetMs());
       const spokenAnswer = fitAliceText(result.answer);
       const search = result.searched ? { query: searchPlan.topic || text } : nextSearch;
-      return reply(spokenAnswer, [...state.history, { role: 'user', text }, { role: 'model', text: spokenAnswer }], search);
+      return finishAnswer(spokenAnswer, search);
     }
     if (backend !== 'gemini') throw new Error('INVALID_LLM_BACKEND');
     let searchContext = '';
     if (searchPlan.required) {
-      const search = await searchWeb(searchPlan.query, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - MIN_GEMINI_BUDGET_MS - FINAL_RESPONSE_RESERVE_MS)));
+      const search = await searchWeb(searchPlan.query, Math.min(SERPER_TIMEOUT_MS, Math.max(0, modelBudgetMs() - MIN_GEMINI_BUDGET_MS)));
       if (search.status !== 'ok') {
         console.warn(`SEARCH_${search.status.toUpperCase()}`);
         return reply(searchFailureText(search.status), state.history, nextSearch);
       }
       searchContext = search.context;
     }
-    const answer = await askGemini(text, state.history, searchContext, Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - FINAL_RESPONSE_RESERVE_MS)));
+    const answer = await askGemini(text, state.history, searchContext, Math.max(0, Math.min(GEMINI_TIMEOUT_MS, modelBudgetMs())));
     const spokenAnswer = fitAliceText(answer);
-    return reply(spokenAnswer, [...state.history, { role: 'user', text }, { role: 'model', text: spokenAnswer }], nextSearch);
+    return finishAnswer(spokenAnswer, nextSearch);
   } catch (error) {
     const known = /^(?:INVALID_LLM_BACKEND|MISSING_OPENROUTER_KEY|OPENROUTER_ACCESS_DENIED|OPENROUTER_BALANCE|OPENROUTER_QUOTA|OPENROUTER_REQUEST_FAILED|OPENROUTER_OUTPUT_LIMIT|OPENROUTER_INCOMPLETE_RESPONSE|OPENROUTER_EMPTY_RESPONSE|OPENROUTER_SEARCH_UNVERIFIED|OPENROUTER_RESPONSE_LANGUAGE|MISSING_GEMINI_KEY|INVALID_MODEL_NAME|GEMINI_KEY_REJECTED|GEMINI_QUOTA|GEMINI_BLOCKED|GEMINI_EMPTY_RESPONSE|GEMINI_REQUEST_FAILED|TIME_BUDGET_EXHAUSTED|REQUEST_TIMEOUT)$/;
     console.warn(known.test(error?.message) ? error.message : 'UPSTREAM_ERROR');
