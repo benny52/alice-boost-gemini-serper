@@ -12,6 +12,7 @@ function setup(t, responder) {
       if (value === undefined) delete process.env[key]; else process.env[key] = value;
     }
   });
+  t.mock.method(console, 'info', () => {});
   t.mock.method(console, 'warn', () => {});
   t.mock.method(console, 'error', () => {});
   const calls = [];
