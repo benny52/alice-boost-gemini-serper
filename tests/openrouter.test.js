@@ -22,7 +22,7 @@ function setup(t, responder, backend = 'openrouter') {
 }
 function completion(text, { searched = false, citations = searched, finish = 'stop' } = {}) {
   return Response.json({
-    id: 'artificial-response', provider: 'DeepInfra', model: 'deepseek/deepseek-v4-flash-0731',
+    id: 'artificial-response', provider: 'Cerebras', model: 'openai/gpt-oss-120b',
     choices: [{ finish_reason: finish, message: { role: 'assistant', content: text,
       annotations: citations ? [{ type: 'url_citation', url_citation: { url: 'https://example.com/weather', title: 'Искусственный источник', content: 'Тестовый прогноз: ясно.' } }] : [] } }],
     usage: { prompt_tokens: 100, completion_tokens: 10, completion_tokens_details: { reasoning_tokens: 0 }, server_tool_use: { web_search_requests: searched ? 1 : 0 } }
@@ -44,12 +44,13 @@ test('OpenRouter answers through exactly the selected provider and carries histo
   assert.equal(calls.length, 1);
   const { url, body } = calls[0];
   assert.equal(url, 'https://openrouter.ai/api/v1/chat/completions');
-  assert.equal(body.model, 'deepseek/deepseek-v4-flash-0731');
-  assert.deepEqual(body.provider.only, ['deepinfra/fp8']);
+  assert.equal(body.model, 'openai/gpt-oss-120b');
+  assert.deepEqual(body.provider.only, ['cerebras/fp16']);
   assert.equal(body.provider.allow_fallbacks, false);
-  assert.equal(body.reasoning.enabled, false);
+  assert.equal(body.provider.require_parameters, true);
+  assert.deepEqual(body.reasoning, { effort: 'low', exclude: true });
   assert.equal(body.stream, false);
-  assert.ok(body.max_tokens <= 240);
+  assert.equal(body.max_tokens, 1024);
   assert.deepEqual(body.messages.slice(1, 3), [{ role: 'user', content: remembered.history[0].text }, { role: 'assistant', content: 'Запомнил.' }]);
   assert.match(body.messages[0].content, /Супер Гений/);
   assert.match(body.messages[0].content, new RegExp(new Date().toISOString().slice(0,10)));
@@ -67,18 +68,21 @@ test('fresh follow-up uses one bounded OpenRouter search with context and no Ser
   assert.equal(calls.length, 2);
   assert.ok(calls.every(call => call.url.startsWith('https://openrouter.ai/')));
   const body = calls[1].body;
-  assert.equal(body.tool_choice, 'required');
-  assert.equal(body.max_tool_calls, 1);
-  assert.deepEqual(body.tools, [{ type: 'openrouter:web_search', parameters: {
-    engine: 'exa', mode: 'instant', max_results: 3, max_total_results: 3, max_uses: 1, max_characters: 1200
-  } }]);
+  assert.equal(body.tools, undefined);
+  assert.equal(body.tool_choice, undefined);
+  assert.equal(body.max_tool_calls, undefined);
+  assert.equal(body.plugins.length, 1);
+  const { search_prompt, ...searchConfig } = body.plugins[0];
+  assert.deepEqual(searchConfig, { id: 'web', engine: 'exa', mode: 'instant', max_results: 3 });
+  assert.match(search_prompt, /по-русски/);
   assert.match(body.messages.at(-1).content, /Казан/i);
   assert.match(body.messages.at(-1).content, /завтра/i);
 });
 
-test('model-initiated search retains its topic for the next question', async t => {
-  setup(t, () => completion('Гонка в воскресенье.', { searched: true }));
+test('the next race requires preliminary search even without an explicit find command', async t => {
+  const { calls } = setup(t, () => completion('Гонка в воскресенье.', { searched: true }));
   const result = await ask('Когда ближайшая гонка Формулы-1?');
+  assert.equal(calls[0].body.plugins?.[0]?.engine, 'exa');
   assert.match(result.session_state.search.query, /Формулы-1/);
 });
 
@@ -98,7 +102,8 @@ test('an ordinary question can answer without paying for a search', async t => {
   const { calls } = setup(t);
   const result = await ask('Сколько будет 25 умножить на 4?');
   assert.equal(result.response.text, 'Сто.');
-  assert.equal(calls[0].body.tool_choice, 'auto');
+  assert.deepEqual(calls[0].body.plugins, []);
+  assert.equal(calls[0].body.tools, undefined);
   assert.ok(!result.session_state.search?.query);
 });
 
@@ -148,7 +153,8 @@ test('OpenRouter body reading is cancelled within the Alice budget and history s
   const { calls } = setup(t, ({signal}) => ({ ok:true,status:200,json:()=>new Promise((resolve,reject)=> {
     signal.addEventListener('abort',()=>{aborted=true;reject(signal.reason);},{once:true});
   }) }));
-  const result = await ask('Расскажи о котах', remembered);
+  const result = await ask('Найди погоду в Казани', remembered);
+  assert.equal(calls[0].body.plugins?.[0]?.mode, 'instant');
   assert.equal(calls.length,1);
   assert.equal(aborted,true);
   assert.match(result.response.text,/Не успела/);
@@ -156,7 +162,7 @@ test('OpenRouter body reading is cancelled within the Alice budget and history s
 });
 
 test('real Exa citation shape works even when usage has no search counter', async t => {
-  setup(t, () => Response.json({ provider:'DeepInfra', choices:[{
+  setup(t, () => Response.json({ provider:'Cerebras', choices:[{
     finish_reason:'stop', message:{role:'assistant',content:'Ответ из источника [1].',annotations:[{
       type:'url_citation',url_citation:{url:'https://example.com/race',title:'Тестовый календарь',content:'Тестовая гонка — 25 октября.'}
     }]}
@@ -165,7 +171,7 @@ test('real Exa citation shape works even when usage has no search counter', asyn
   assert.equal(result.response.text,'Ответ из источника.');
   assert.equal(result.session_state.history.at(-1).text,result.response.text);
 });
-test('auto search with an empty citation and missing search counter fails closed', async t => {
+test('preliminary search with an empty citation and missing search counter fails closed', async t => {
   const { calls, logs } = setup(t, () => Response.json({choices:[{
     finish_reason:'stop',message:{content:'Непроверенная дата.',annotations:[{
       type:'url_citation',url_citation:{url:'https://example.com/race',title:'Календарь',content:''}
@@ -173,8 +179,51 @@ test('auto search with an empty citation and missing search counter fails closed
   }],usage:{completion_tokens:10}}));
   const result=await ask('Когда ближайшая гонка Формулы-1?',remembered);
   assert.equal(calls.length,1);
-  assert.equal(calls[0].body.tool_choice,'auto');
+  assert.equal(calls[0].body.plugins?.[0]?.engine,'exa');
   assert.ok(logs.some(([event])=>event==='OPENROUTER_SEARCH_UNVERIFIED'));
   assert.doesNotMatch(result.response.text,/Непроверенная дата/);
   assert.deepEqual(result.session_state.history,remembered.history);
+});
+
+test('a new arithmetic topic disables preliminary search after a sourced answer', async t => {
+  const { calls } = setup(t, call => completion(call.body.plugins?.length ? 'В Казани ясно.' : 'Сто.', { searched: Boolean(call.body.plugins?.length) }));
+  const first = await ask('Найди погоду в Казани');
+  const result = await ask('Сколько будет 25 умножить на 4?', first.session_state);
+  assert.equal(result.response.text, 'Сто.');
+  assert.deepEqual(calls[1].body.plugins, []);
+  assert.equal(calls[1].body.tools, undefined);
+  assert.ok(!result.session_state.search?.query);
+});
+
+test('Russian sourced speech removes bold formatting, citations and source domains', async t => {
+  setup(t, () => completion('Ближайшая гонка — **Гран-при США** в Остине, 25 октября. Источник: [example.com](https://example.com/race).', { searched: true }));
+  const result = await ask('Найди дату ближайшей гонки');
+  assert.equal(result.response.text, 'Ближайшая гонка — Гран-при США в Остине, 25 октября.');
+  assert.equal(result.session_state.history.at(-1).text, result.response.text);
+});
+
+for (const foreignAnswer of ['Ближайшая гонка — Grand Prix of the USA (Austin), 25 октября.', 'Ближайшая гонка — [Grand Prix](https://example.com/race).', 'Ответ: 北京。']) {
+  test('foreign response is not spoken or saved: ' + foreignAnswer, async t => {
+    const { calls, logs } = setup(t, () => completion(foreignAnswer, { searched: true }));
+    const result = await ask('Найди дату ближайшей гонки', remembered);
+    assert.equal(calls.length, 1);
+    assert.match(result.response.text, /по-русски/);
+    assert.deepEqual(result.session_state.history, remembered.history);
+    assert.ok(logs.some(([event]) => event === 'OPENROUTER_RESPONSE_LANGUAGE'));
+    assert.doesNotMatch(JSON.stringify(logs), /Grand Prix|北京/);
+  });
+}
+
+test('numeric answers are allowed and hidden reasoning never enters speech or memory', async t => {
+  setup(t, () => Response.json({ choices: [{ finish_reason: 'stop', message: { content: '100.', reasoning: 'private English thought' } }] }));
+  const result = await ask('25 умножить на 4');
+  assert.equal(result.response.text, '100.');
+  assert.equal(result.session_state.history.at(-1).text, '100.');
+  assert.doesNotMatch(JSON.stringify(result), /private|English/);
+});
+test('a linked numeric date remains in the spoken answer and history', async t => {
+  setup(t, () => completion('Гонка состоится [25.10.2026](https://example.com/race).', { searched: true }));
+  const result = await ask('Найди дату ближайшей гонки');
+  assert.equal(result.response.text, 'Гонка состоится 25.10.2026.');
+  assert.equal(result.session_state.history.at(-1).text, result.response.text);
 });

@@ -74,9 +74,10 @@ function errorForUser(error) {
     case 'MISSING_GEMINI_KEY': return 'Сервер пока не настроен. Не удалось подключиться к нейросети.';
     case 'OPENROUTER_ACCESS_DENIED':
     case 'GEMINI_KEY_REJECTED': return 'Не удалось подключиться к нейросети. Нужно проверить настройки доступа.';
-    case 'OPENROUTER_BALANCE': return 'Не удалось получить ответ: нужно проверить баланс OpenRouter.';
+    case 'OPENROUTER_BALANCE': return 'Не удалось получить ответ: нужно проверить баланс сервиса нейросети.';
     case 'OPENROUTER_QUOTA': return 'Сейчас превышен лимит запросов к нейросети. Попробуй немного позже.';
     case 'OPENROUTER_SEARCH_UNVERIFIED': return 'Не удалось подтвердить ответ источниками из поиска. Попробуй уточнить вопрос.';
+    case 'OPENROUTER_RESPONSE_LANGUAGE': return 'Не получилось сформулировать ответ полностью по-русски. Попробуй переформулировать вопрос.';
     case 'OPENROUTER_OUTPUT_LIMIT': return 'Ответ получился слишком длинным. Попробуй задать вопрос короче.';
     case 'GEMINI_QUOTA': return 'Сейчас превышен лимит запросов к Gemini. Попробуй немного позже.';
     case 'GEMINI_BLOCKED': return 'Я не смогла обработать этот запрос. Попробуй спросить иначе.';
@@ -125,7 +126,7 @@ export default async function handler(req, res) {
     const spokenAnswer = fitAliceText(answer);
     return reply(spokenAnswer, [...state.history, { role: 'user', text }, { role: 'model', text: spokenAnswer }], nextSearch);
   } catch (error) {
-    const known = /^(?:INVALID_LLM_BACKEND|MISSING_OPENROUTER_KEY|OPENROUTER_ACCESS_DENIED|OPENROUTER_BALANCE|OPENROUTER_QUOTA|OPENROUTER_REQUEST_FAILED|OPENROUTER_OUTPUT_LIMIT|OPENROUTER_INCOMPLETE_RESPONSE|OPENROUTER_EMPTY_RESPONSE|OPENROUTER_SEARCH_UNVERIFIED|MISSING_GEMINI_KEY|INVALID_MODEL_NAME|GEMINI_KEY_REJECTED|GEMINI_QUOTA|GEMINI_BLOCKED|GEMINI_EMPTY_RESPONSE|GEMINI_REQUEST_FAILED|TIME_BUDGET_EXHAUSTED|REQUEST_TIMEOUT)$/;
+    const known = /^(?:INVALID_LLM_BACKEND|MISSING_OPENROUTER_KEY|OPENROUTER_ACCESS_DENIED|OPENROUTER_BALANCE|OPENROUTER_QUOTA|OPENROUTER_REQUEST_FAILED|OPENROUTER_OUTPUT_LIMIT|OPENROUTER_INCOMPLETE_RESPONSE|OPENROUTER_EMPTY_RESPONSE|OPENROUTER_SEARCH_UNVERIFIED|OPENROUTER_RESPONSE_LANGUAGE|MISSING_GEMINI_KEY|INVALID_MODEL_NAME|GEMINI_KEY_REJECTED|GEMINI_QUOTA|GEMINI_BLOCKED|GEMINI_EMPTY_RESPONSE|GEMINI_REQUEST_FAILED|TIME_BUDGET_EXHAUSTED|REQUEST_TIMEOUT)$/;
     console.warn(known.test(error?.message) ? error.message : 'UPSTREAM_ERROR');
     return reply(errorForUser(error), state.history, nextSearch);
   }
