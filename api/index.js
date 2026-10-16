@@ -2,6 +2,7 @@ import { clipText, safeHistory, packState, readState } from '../lib/session.js';
 import { fetchJson } from '../lib/http.js';
 import { memoryConfig, conversationId, loadMemory, saveMemory, logMemoryError, MEMORY_WRITE_TIMEOUT_MS } from '../lib/memory.js';
 import { askOpenRouter } from '../lib/openrouter.js';
+import { launchGreeting } from '../lib/greeting.js';
 import { isSearchIntent, planSearch, searchWeb, searchFailureText } from '../lib/search.js';
 
 const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
@@ -97,7 +98,7 @@ export default async function handler(req, res) {
   const startedAt = Date.now();
   const remainingMs = () => TOTAL_RESPONSE_BUDGET_MS - (Date.now() - startedAt);
   const body = req.body && typeof req.body === 'object' ? req.body : {};
-  const text = String(body?.request?.command || body?.request?.original_utterance || '').trim();
+  const text = String(body?.request?.command ?? body?.request?.original_utterance ?? '').trim();
   let state = readState(body?.session?.new ? {} : body?.state?.session);
   const reply = (answer, history = state.history, search = state.search) => res.status(200).json(aliceResponse(answer, false, history, search));
   let config;
@@ -140,8 +141,12 @@ export default async function handler(req, res) {
   const modelBudgetMs = () => remainingMs() - FINAL_RESPONSE_RESERVE_MS - writeReserveMs;
 
   if (!text) {
-    const greeting = 'Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?';
-    return reply(memoryUnavailable ? greeting + ' Память сейчас недоступна.' : greeting);
+    const audio = launchGreeting(body.session);
+    const greeting = audio?.text || 'Привет! Я могу ответить на вопрос или найти актуальную информацию. Что хочешь узнать?';
+    const warning = memoryUnavailable ? ' Память сейчас недоступна.' : '';
+    const result = aliceResponse(greeting + warning, false, state.history, state.search);
+    if (audio) result.response.tts = audio.tts + warning;
+    return res.status(200).json(result);
   }
   if (/^(?:забудь разговор|забудь вс[её]|начнём сначала|начнем сначала)[.!?]*$/i.test(text)) {
     if (config) {
