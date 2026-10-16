@@ -1,5 +1,6 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import { setTimeout as delay } from 'node:timers/promises';
 import handler from '../api/index.js';
 
 function setup(t, responder) {
@@ -182,4 +183,42 @@ test('a non-JSON quota response still explains the quota failure', async t => {
   setup(t, () => new Response('Too many requests', { status: 429 }));
   const result = await ask('Расскажи сказку');
   assert.match(result.response.text, /лимит/);
+});
+
+test('timing: a slow successful search reaches Gemini with its sources', { timeout: 6000 }, async t => {
+  const calls = setup(t, async call => {
+    await delay(call.service === 'search' ? 1100 : 1600, undefined, { signal: call.signal });
+    return call.service === 'search' ? searchReply() : modelReply('Ответ по тестовому источнику.');
+  });
+  const result = await ask('Найди дату тестового события');
+  assert.equal(result.response.text, 'Ответ по тестовому источнику.');
+  assert.deepEqual(calls.map(call => call.service), ['search', 'gemini']);
+  assert.match(calls[1].body.contents.at(-1).parts[0].text, /Сведения для теста/);
+  assert.equal(result.session_state.history.at(-1).text, result.response.text);
+});
+
+test('timing: Gemini can use the remaining time when search is unnecessary', { timeout: 6000 }, async t => {
+  const calls = setup(t, async call => {
+    await delay(2900, undefined, { signal: call.signal });
+    return modelReply('Сто.');
+  });
+  const result = await ask('Сколько будет 25 умножить на 4?');
+  assert.equal(result.response.text, 'Сто.');
+  assert.deepEqual(calls.map(call => call.service), ['gemini']);
+});
+
+test('timing: combined search and generation still respect the response deadline', { timeout: 6000 }, async t => {
+  const calls = setup(t, async call => {
+    await delay(call.service === 'search' ? 1100 : 3000, undefined, { signal: call.signal });
+    return call.service === 'search' ? searchReply() : modelReply('Слишком поздний ответ.');
+  });
+  const history = [{ role: 'user', text: 'Назови героя' }, { role: 'model', text: 'Героя зовут Тест.' }];
+  const startedAt = performance.now();
+  const result = await ask('Найди дату тестового события', { history });
+  const elapsedMs = performance.now() - startedAt;
+  assert.deepEqual(calls.map(call => call.service), ['search', 'gemini']);
+  assert.equal(calls[1].signal.aborted, true);
+  assert.match(result.response.text, /не успела подготовить/i);
+  assert.deepEqual(result.session_state.history, history);
+  assert.ok(elapsedMs < 4000, `response missed its deadline: ${elapsedMs} ms`);
 });

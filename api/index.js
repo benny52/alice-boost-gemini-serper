@@ -5,8 +5,10 @@ import { isSearchIntent, planSearch, searchWeb, searchFailureText } from '../lib
 const DEFAULT_MODEL = 'gemini-3.5-flash-lite';
 const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 3600;
-const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const FINAL_RESPONSE_RESERVE_MS = 200;
+const MIN_GEMINI_BUDGET_MS = 1800;
+const SERPER_TIMEOUT_MS = 1500;
+const GEMINI_TIMEOUT_MS = TOTAL_RESPONSE_BUDGET_MS - FINAL_RESPONSE_RESERVE_MS;
 const SYSTEM_PROMPT = [
   'Ты — полезный голосовой помощник в навыке Яндекс Алисы.',
   'Отвечай естественно, по-русски, кратко и так, чтобы ответ было удобно слушать.',
@@ -96,14 +98,14 @@ export default async function handler(req, res) {
   try {
     let searchContext = '';
     if (searchPlan.required) {
-      const search = await searchWeb(searchPlan.query, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
+      const search = await searchWeb(searchPlan.query, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - MIN_GEMINI_BUDGET_MS - FINAL_RESPONSE_RESERVE_MS)));
       if (search.status !== 'ok') {
         console.warn(`SEARCH_${search.status.toUpperCase()}`);
         return reply(searchFailureText(search.status), state.history, nextSearch);
       }
       searchContext = search.context;
     }
-    const answer = await askGemini(text, state.history, searchContext, Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600)));
+    const answer = await askGemini(text, state.history, searchContext, Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - FINAL_RESPONSE_RESERVE_MS)));
     const spokenAnswer = fitAliceText(answer);
     return reply(spokenAnswer, [...state.history, { role: 'user', text }, { role: 'model', text: spokenAnswer }], nextSearch);
   } catch (error) {
